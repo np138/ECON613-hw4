@@ -1,0 +1,179 @@
+---
+title: "Assignment 4 Linear Panel Data"
+author: "Nond Prueksiri"
+date: "April 8, 2019"
+output: pdf_document
+---
+
+# Exercise 1 Data
+## Data Preparation
+```{r setup, echo=FALSE}
+rm(list = ls())
+library(foreign)
+library(ggplot2)
+library(dplyr)
+library(plm)
+library(data.table)
+library(dummies)
+library(httr)
+Koop.Tobias <- read.csv("https://raw.githubusercontent.com/ms486/Econ613/master/Assignments/A4/Koop-Tobias.csv")
+panel <- pdata.frame(Koop.Tobias, index=c("PERSONID","TIMETRND"), drop.index=FALSE, row.names=TRUE)
+panel_default <- pdata.frame(Koop.Tobias, index=c("PERSONID","TIMETRND"), drop.index=FALSE, row.names=TRUE)
+```
+
+## Panel dimension of wages for 5 randomly selected individuals
+```{r 1.Sample Data}
+sample <- sample(unique(panel$PERSONID), 5)
+sample_df <- subset(panel, panel$PERSONID %in% sample)
+as.matrix(sample_df$LOGWAGE)
+
+```
+
+
+# Exercise 2 Random Effects
+To estimate random effect by hand, I do the two following steps;
+* Step 1: estimate lamda ( 1 - ratio of standard error of residual over standard error of residual plus standard error
+of intercept term times number of time periods) by pooled OLS
+
+```{r 2A Random Effects, warning= FALSE}
+
+rm(sample, sample_df)
+
+OLS <- lm(LOGWAGE ~ EDUC + POTEXPER, data = panel)
+var_alpha <- (coef(summary(OLS))[1,2])^2
+var_resid <- var(OLS$residuals)
+lamda <- 1 - sqrt(var_resid / (var_resid + 15*var_alpha))
+lamda
+```
+
+* Step 2: use lamda estimated from step 1 to transform variable, that is; x_transform = x - lamda*mean_x
+
+```{r 2B Random Effects, warning= FALSE}
+panel <- data.table(panel)
+setkey(panel,PERSONID)
+panel <- panel[,mean_LOGWAGE:=mean(LOGWAGE),by=PERSONID]
+panel <- panel[,mean_POTEXPER:=mean(POTEXPER),by=PERSONID]
+panel <- panel[,mean_EDUC:=mean(EDUC),by=PERSONID]
+
+panel <- panel[,re_LOGWAGE:= LOGWAGE - lamda*mean_LOGWAGE]
+panel <- panel[,re_POTEXPER:= POTEXPER - lamda*mean_POTEXPER]
+panel <- panel[,re_EDUC:= EDUC - lamda*mean_EDUC]
+
+RE <- lm(re_LOGWAGE ~ re_POTEXPER + re_EDUC, data = panel)
+summary(RE)
+```
+
+* Check if the estimated random effects closed to the estimation provided by the package plm
+```{r 2C Check}
+RE_check <- plm(LOGWAGE ~ POTEXPER + EDUC, data = panel_default, model = "random")
+summary(RE_check)
+
+```
+
+# Exercise 3 Fixed Effects
+
+## Between Estimator
+```{r 3A Fixed Effects, warning= FALSE}
+
+between_panel <- aggregate(panel, list(panel$PERSONID), mean)
+Between <- lm(LOGWAGE ~ EDUC + POTEXPER, data = between_panel)
+summary(Between)
+```
+
+## within estimator
+```{r 3B Fixed Effects, warning= FALSE}
+panel <- panel[,fe_LOGWAGE:= LOGWAGE - mean_LOGWAGE]
+panel <- panel[,fe_POTEXPER:= POTEXPER - mean_POTEXPER]
+panel <- panel[,fe_EDUC:= EDUC - mean_EDUC]
+Within <- lm(fe_LOGWAGE ~ 0 + fe_EDUC + fe_POTEXPER, data = panel)
+summary(Within)
+```
+
+## First time difference
+```{r 3C Fixed Effects, warning= FALSE} 
+
+panel <- panel[,d_LOGWAGE:=c(NA,diff(LOGWAGE)),by=PERSONID]
+panel <- panel[,d_EDUC:=c(NA,diff(EDUC)), by=PERSONID]
+panel <- panel[,d_POTEXPER:=c(NA,diff(POTEXPER)), by=PERSONID]
+panel <- panel[,d_TIMETRND:=c(NA,diff(TIMETRND)),by=PERSONID]
+FD <- lm(d_LOGWAGE ~ 0 + d_EDUC + d_POTEXPER, data = panel[d_TIMETRND == 1])
+summary(FD)
+```
+## Comparison between the three models
+```{r 3D Comaprison}
+FE <- coef(Between)
+FE <- as.data.frame(rbind(FE, c(NA, coef(Within)) , c(NA,coef(FD))))  
+row.names(FE) <- c("Between", "Within", "First time difference")
+FE
+```
+
+# Exercise 4 Understanding Fixed Effects
+
+* Write and optimize likelihood function to estimate "alpha" - individual fixed effects
+
+```{r 4, warning= FALSE}
+
+sample100 = sample(unique(panel$PERSONID), 100)
+panel100 <- subset(panel_default, panel_default$PERSONID %in% sample100)
+D <- dummy("PERSONID", data = panel100, sep="")
+X <- panel100[,2]
+X <- cbind(X, panel100[,4], D)
+Y <- panel100[,3]
+
+mle <- function(coeff) {
+  beta <- coeff[1:102]
+  sigma <- exp(coeff[103])
+  p <- (Y - X%*%beta)/sigma
+  ll <- sum(log(dnorm(p)/sigma))
+  return(-ll)
+}
+
+coeff <- matrix(0, nrow = 103)
+
+est <- nlm(mle,coeff)
+```
+
+* Regression of fixed effects
+```{r 4B}
+panel_alpha <- as.matrix(est$estimate)[3:102,]
+panel_alpha <- cbind(panel_alpha, sort(sample100))
+FE_character <- unique(merge(panel_alpha, panel100, by.x ="V2", by.y="PERSONID")[,-(3:6)])
+lm_Character <- lm(panel_alpha ~ ABILITY + MOTHERED +FATHERED + BRKNHOME + SIBLINGS, data=FE_character)
+summary(lm_Character)
+```
+
+* The standard errors
+The standard error here may not be correct due to the fact that we random only 100 observation 
+from the whole sample of more than 2,000 individual. The possible method to improve this is to
+calculate them by "bootstrap" in order to increase the precision of standard errors given there are
+more simulated datasets
+
+```{r 4C, warning= FALSE }
+
+boot_coef <- matrix(0, nrow = 1, ncol=6)
+
+for (i in 1:49) {
+sample100 = sample(unique(panel$PERSONID), 100)
+panel100 <- subset(panel_default, panel_default$PERSONID %in% sample100)
+D <- dummy("PERSONID", data = panel100, sep="")
+X <- panel100[,2]
+X <- cbind(X, panel100[,4], D)
+Y <- panel100[,3]
+coeff <- matrix(0, nrow = 103)
+
+est_boot <- nlm(mle,coeff)
+panel_alpha <- as.matrix(est_boot$estimate)[3:102,]
+panel_alpha <- cbind(panel_alpha, sort(sample100))
+FE_character <- unique(merge(panel_alpha, panel100, by.x ="V2", by.y="PERSONID")[,-(3:6)])
+lm_Character <- lm(panel_alpha ~ ABILITY + MOTHERED +FATHERED + BRKNHOME + SIBLINGS, data=FE_character)
+coeff <- as.matrix(coef(lm_Character))
+boot_coef <- rbind(boot_coef, t(coeff))
+}
+
+boot_sd <- (c(sd(boot_coef[,1]), sd(boot_coef[,2]), sd(boot_coef[,3]), sd(boot_coef[,4]), sd(boot_coef[,5]), sd(boot_coef[,6])))
+boot_sd <- as.data.frame(boot_sd)
+rownames(boot_sd) <- c("intercept", "ABILITY" ,"MOTHERED" ,"FATHERED" ,"BRKNHOME" ,"SIBLINGS")
+boot_sd
+```
+The above shows standard errors from bootstrap method using 49 replications.
+
